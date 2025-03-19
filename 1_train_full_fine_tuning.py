@@ -11,48 +11,49 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-        set_seed,
-
+    set_seed,
 )
-from trl import setup_chat_format
+from trl import setup_chat_format, SFTTrainer
 from peft import LoraConfig
-
-from trl import (
-   SFTTrainer)
-
-
 from sklearn.model_selection import train_test_split
+
+import yaml
+import requests
 
 # Load dataset from the hub
 
 from huggingface_hub import login
 
 login(
-    token="허깅페이스 토큰 입력",
+    token="토큰 입력",
     add_to_git_credential=True
 )
 
-### 3.5.3. 데이터셋 준비 
+# 데이터셋 경로 기본값 설정
+default_dataset_path = "C:/Users/user/juyeon/data"
+
 dataset = load_dataset("beomi/KoAlpaca-v1.1a")
 columns_to_remove = list(dataset["train"].features)
 
-system_prompt = "당신은 다양한 분야의 전문가들이 제공한 지식과 정보를 바탕으로 만들어진 AI 어시스턴트입니다. 사용자들의 질문에 대해 정확하고 유용한 답변을 제공하는 것이 당신의 주요 목표입니다. 복잡한 주제에 대해서도 이해하기 쉽게 설명할 수 있으며, 필요한 경우 추가 정보나 관련 예시를 제공할 수 있습니다. 항상 객관적이고 중립적인 입장을 유지하면서, 최신 정보를 반영하여 답변해 주세요. 사용자의 질문이 불분명한 경우 추가 설명을 요청하고, 당신이 확실하지 않은 정보에 대해서는 솔직히 모른다고 말해주세요."
- 
+system_prompt = "당신은 다양한 분야의 전문가들이 제공한 지식과 정보를 바탕으로 만들어진 AI 어시스턴트입니다. 사용자들의 질문에 대해 정확하고 유용한 답변을 제공하는 것이 당신의 주요 목표입니다. ..."
+
 train_dataset = dataset.map(
-    lambda sample: 
-    { 'messages' : [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": sample['instruction']},
-        {"role": "assistant", "content": sample['output']}]
-                   },
+    lambda sample: {
+        'messages': [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": sample['instruction']},
+            {"role": "assistant", "content": sample['output']}
+        ]
+    },
 )
 
-train_dataset = train_dataset.map(remove_columns=columns_to_remove,batched=False)
+train_dataset = train_dataset.map(remove_columns=columns_to_remove, batched=False)
 train_dataset = train_dataset["train"].train_test_split(test_size=0.1, seed=42)
 
-train_dataset["train"].to_json("train_dataset.json", orient="records", force_ascii=False)
-train_dataset["test"].to_json("test_dataset.json", orient="records", force_ascii=False)
-
+# 데이터셋을 지정된 경로에 저장
+os.makedirs(default_dataset_path, exist_ok=True)
+train_dataset["train"].to_json(os.path.join(default_dataset_path, "train_dataset.json"), orient="records", force_ascii=False)
+train_dataset["test"].to_json(os.path.join(default_dataset_path, "test_dataset.json"), orient="records", force_ascii=False)
 
 LLAMA_3_CHAT_TEMPLATE = (
     "{% for message in messages %}"
@@ -69,62 +70,74 @@ LLAMA_3_CHAT_TEMPLATE = (
     "{% endif %}"
 )
 
-### 3.5.4. Llama3 모델 파라미터 설정 
+# GitHub Raw 파일 URL
+GITHUB_YAML_URL = "https://raw.githubusercontent.com/Zuyeonn/LLM-finetuning/refs/heads/main/0_full_fine_tuning_config.yaml"
+
+# GitHub에서 YAML 파일 다운로드
+response = requests.get(GITHUB_YAML_URL)
+
+if response.status_code == 200:
+    config = yaml.safe_load(response.text)  # YAML 파싱
+else:
+    raise ValueError("Failed to fetch YAML file from GitHub. Check the URL.")
+
 @dataclass
 class ScriptArguments:
     dataset_path: str = field(
-        default=None,
-        metadata={
-            "help": "데이터셋 파일 경로"
-        },
+        default=config.get("dataset_path", default_dataset_path),  # YAML에서 불러오기
+        metadata={"help": "데이터셋 파일 경로"}
     )
     model_name: str = field(
-    default=None, metadata={"help": "SFT 학습에 사용할 모델 ID"}
+        default=config.get("model_name", "meta-llama/Meta-Llama-3.1-8B-Instruct"),  # YAML에서 불러오기
+        metadata={"help": "SFT 학습에 사용할 모델 ID"}
     )
     max_seq_length: int = field(
         default=512, metadata={"help": "SFT Trainer에 사용할 최대 시퀀스 길이"}
     )
     question_key: str = field(
-    default=None, metadata={"help": "지시사항 데이터셋의 질문 키"}
+        default=None, metadata={"help": "지시사항 데이터셋의 질문 키"}
     )
     answer_key: str = field(
-    default=None, metadata={"help": "지시사항 데이터셋의 답변 키"}
+        default=None, metadata={"help": "지시사항 데이터셋의 답변 키"}
     )
 
+def training_function(script_args, training_args):
+    # dataset_path가 None이거나 모델 경로로 지정되었으면 올바른 경로로 설정
+    if script_args.dataset_path is None or "meta-llama" in script_args.dataset_path:
+        script_args.dataset_path = default_dataset_path
+    
+    # 절대 경로 변환 (경로 문제 방지)
+    train_dataset_path = os.path.abspath(os.path.join(script_args.dataset_path, "train_dataset.json"))
+    test_dataset_path = os.path.abspath(os.path.join(script_args.dataset_path, "test_dataset.json"))
 
-def training_function(script_args, training_args):    
-    # 데이터셋 불러오기 
-    train_dataset = load_dataset(
-        "json",
-        data_files=os.path.join(script_args.dataset_path, "train_dataset.json"),
-        split="train",
-    )
-    test_dataset = load_dataset(
-        "json",
-        data_files=os.path.join(script_args.dataset_path, "test_dataset.json"),
-        split="train",
-    )
+    print("Final Train Dataset Path:", train_dataset_path)
+    print("Final Test Dataset Path:", test_dataset_path)
+    
+    # 파일 존재 여부 확인
+    if not os.path.exists(train_dataset_path):
+        raise FileNotFoundError(f"Train dataset not found: {train_dataset_path}")
+    if not os.path.exists(test_dataset_path):
+        raise FileNotFoundError(f"Test dataset not found: {test_dataset_path}")
+    
+    train_dataset = load_dataset("json", data_files=train_dataset_path, split="train")
+    test_dataset = load_dataset("json", data_files=test_dataset_path, split="train")
 
-    # 토크나이저 및 데이터셋 chat_template으로 변경하기      
     tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.chat_template = LLAMA_3_CHAT_TEMPLATE
     tokenizer.padding_side = 'right'
     
     def template_dataset(examples):
-        return{"text":  tokenizer.apply_chat_template(examples["messages"], tokenize=False)}
+        return {"text": tokenizer.apply_chat_template(examples["messages"], tokenize=False)}
     
     train_dataset = train_dataset.map(template_dataset, remove_columns=["messages"])
     test_dataset = test_dataset.map(template_dataset, remove_columns=["messages"])
     
-    # 데이터가 변화되었는지 확인하기 위해 2개만 출력하기 
     with training_args.main_process_first(
         desc="Log a few random samples from the processed training set"
     ):
         for index in random.sample(range(len(train_dataset)), 2):
             print(train_dataset[index]["text"])
 
-    # Model 및 파라미터 설정하기 
     model = AutoModelForCausalLM.from_pretrained(
         script_args.model_name,
         attn_implementation="sdpa", 
@@ -134,8 +147,7 @@ def training_function(script_args, training_args):
     
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
-
-    # Train 설정 
+    
     trainer = SFTTrainer(
         model=model,
         args=training_args,
@@ -150,7 +162,7 @@ def training_function(script_args, training_args):
             "append_concat_token": False, 
         },
     )
-
+    
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:
         checkpoint = training_args.resume_from_checkpoint
@@ -161,19 +173,12 @@ def training_function(script_args, training_args):
     trainer.save_model()
     
 if __name__ == "__main__":
-
     parser = TrlParser((ScriptArguments, TrainingArguments))
-    script_args, training_args = parser.parse_args_and_config()    
+    script_args, training_args = parser.parse_args_and_config()
     
     if training_args.gradient_checkpointing:
         training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}
     
-    # set seed
     set_seed(training_args.seed)
-  
-    # launch training
+    
     training_function(script_args, training_args)
-
-print("Starting training function...")
-training_function(script_args, training_args)
-print("Training function finished.")
